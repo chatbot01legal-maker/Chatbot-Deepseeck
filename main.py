@@ -2,12 +2,15 @@ from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
 import os
 import google.generativeai as genai
-import uuid
-from datetime import datetime
+import logging
+
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-# CORS para desarrollo y producción
-CORS(app, origins=["https://www.abolegal.cl", "http://localhost:3000", "https://*.onrender.com"])
+# CORS más permisivo para desarrollo
+CORS(app, origins=["https://www.abolegal.cl", "http://localhost:3000", "https://*.onrender.com", "http://localhost:*"])
 
 # API key de Gemini
 API_KEY = os.getenv("GEMINI_API_KEY")
@@ -15,255 +18,231 @@ if not API_KEY:
     raise ValueError("Por favor define GEMINI_API_KEY en las variables de entorno de Render.")
 
 genai.configure(api_key=API_KEY)
-model_name = "gemini-2.0-flash"  # Cambiado a versión estable
-model = genai.GenerativeModel(model_name)
+model = genai.GenerativeModel('gemini-1.5-flash')
 
-# Almacenamiento simple en memoria (para desarrollo)
-chat_sessions = {}
+LEGAL_PROMPT = """Eres Lex, un asistente legal profesional de AboLegal. 
+Responde como un abogado experto pero accesible. Sé empático pero profesional.
 
-INITIAL_PROMPT = """Eres Lex, un asistente legal profesional de AboLegal. 
-Tu rol es:
-1. Escuchar activamente los problemas legales del usuario
-2. Hacer preguntas claras para entender el caso
-3. Proporcionar orientación legal inicial
-4. Mantener un tono profesional pero empático
+Directrices:
+- Analiza el problema legal del usuario
+- Proporciona orientación legal inicial
+- Sugiere posibles acciones
+- Sé claro y conciso (máximo 250 palabras)
+- Mantén el tono en español
 
-Responde siempre en español y sé conciso (máximo 300 palabras)."""
+Ejemplo de respuesta adecuada:
+"Entiendo tu situación. Los despidos sin indemnización pueden ser injustificados. Te recomiendo reunir toda la documentación: contrato, finiquito, etc. Podrías tener derecho a reclamo por despido injustificado. ¿Tienes algún documento que acredite tu relación laboral?""""
 
-# --- HTML del chat ---
-CHAT_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>AboLegal Chatbot</title>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body { 
-            font-family: 'Segoe UI', Arial, sans-serif; 
-            max-width: 600px; 
-            margin: 0 auto; 
-            padding: 20px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-        }
-        .chat-container {
-            background: white;
-            border-radius: 12px;
-            box-shadow: 0 8px 32px rgba(0,0,0,0.1);
-            overflow: hidden;
-        }
-        .chat-header {
-            background: #2c3e50;
-            color: white;
-            padding: 20px;
-            text-align: center;
-        }
-        .chat-header h1 {
-            margin: 0;
-            font-size: 1.5em;
-        }
-        .chat-header .subtitle {
-            opacity: 0.8;
-            font-size: 0.9em;
-        }
-        #chat-window { 
-            height: 400px; 
-            overflow-y: auto; 
-            padding: 20px;
-            background: #f8f9fa;
-        }
-        .message { 
-            margin-bottom: 15px; 
-            padding: 12px 16px;
-            border-radius: 18px;
-            line-height: 1.4;
-            max-width: 80%;
-            animation: fadeIn 0.3s ease-in;
-        }
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(10px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-        .user { 
-            background: #007bff;
-            color: white;
-            margin-left: auto;
-            border-bottom-right-radius: 4px;
-        }
-        .assistant { 
-            background: white;
-            color: #333;
-            border: 1px solid #e0e0e0;
-            margin-right: auto;
-            border-bottom-left-radius: 4px;
-        }
-        .typing {
-            color: #666;
-            font-style: italic;
-        }
-        #input-container { 
-            display: flex; 
-            padding: 20px;
-            background: white;
-            border-top: 1px solid #eee;
-        }
-        #user-input { 
-            flex-grow: 1; 
-            padding: 12px 16px;
-            border: 2px solid #e0e0e0;
-            border-radius: 25px;
-            outline: none;
-            font-size: 14px;
-        }
-        #user-input:focus {
-            border-color: #007bff;
-        }
-        #send-button { 
-            padding: 12px 24px;
-            background: #007bff;
-            color: white;
-            border: none;
-            border-radius: 25px;
-            cursor: pointer;
-            margin-left: 10px;
-            font-weight: 600;
-            transition: background 0.2s;
-        }
-        #send-button:hover:not(:disabled) {
-            background: #0056b3;
-        }
-        #send-button:disabled { 
-            background: #ccc;
-            cursor: not-allowed;
-        }
-        .message-time {
-            font-size: 0.75em;
-            opacity: 0.6;
-            margin-top: 4px;
-        }
-    </style>
-</head>
-<body>
-    <div class="chat-container">
-        <div class="chat-header">
-            <h1>⚖️ AboLegal Assistant</h1>
-            <div class="subtitle">Asistente Legal Inteligente</div>
-        </div>
-        <div id="chat-window"></div>
-        <div id="input-container">
-            <input type="text" id="user-input" placeholder="Describe tu situación legal..." autocomplete="off">
-            <button id="send-button">Enviar</button>
-        </div>
-    </div>
-
-    <script>
-        const chatWindow = document.getElementById('chat-window');
-        const userInput = document.getElementById('user-input');
-        const sendButton = document.getElementById('send-button');
-        
-        // Generar session ID único
-        const sessionId = 'session_' + Math.random().toString(36).substr(2, 9);
-        let messageHistory = [];
-
-        function appendMessage(sender, message) {
-            const msgDiv = document.createElement('div');
-            msgDiv.classList.add('message', sender);
-            
-            const time = new Date().toLocaleTimeString('es-ES', { 
-                hour: '2-digit', 
-                minute: '2-digit' 
-            });
-            
-            msgDiv.innerHTML = `
-                <div>${message.replace(/\n/g, '<br>')}</div>
-                <div class="message-time">${time}</div>
-            `;
-            
-            chatWindow.appendChild(msgDiv);
-            chatWindow.scrollTop = chatWindow.scrollHeight;
-        }
-
-        // Mensaje inicial
-        document.addEventListener('DOMContentLoaded', () => {
-            appendMessage('assistant', 'Hola, soy Lex, tu asesor legal de AboLegal. ¿En qué puedo ayudarte hoy? Cuéntame brevemente tu situación legal.');
-        });
-
-        async function sendMessage() {
-            const message = userInput.value.trim();
-            if (!message) return;
-
-            appendMessage('user', message);
-            messageHistory.push({ role: 'user', content: message });
-            userInput.value = '';
-            sendButton.disabled = true;
-            userInput.disabled = true;
-
-            // Indicador de typing
-            const typingIndicator = document.createElement('div');
-            typingIndicator.id = 'typing-indicator';
-            typingIndicator.classList.add('message', 'assistant', 'typing');
-            typingIndicator.innerHTML = 'Lex está analizando tu caso...';
-            chatWindow.appendChild(typingIndicator);
-            chatWindow.scrollTop = chatWindow.scrollHeight;
-
-            try {
-                // URL dinámica del backend
-                const backend_url = window.location.origin + '/chat';
-                
-                const response = await fetch(backend_url, {
-                    method: 'POST',
-                    headers: { 
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ 
-                        message: message,
-                        session_id: sessionId,
-                        history: messageHistory
-                    })
-                });
-
-                if (!response.ok) {
-                    throw new Error(`Error ${response.status}: ${response.statusText}`);
-                }
-
-                const data = await response.json();
-                
-                // Remover indicador de typing
-                if (document.getElementById('typing-indicator')) {
-                    chatWindow.removeChild(typingIndicator);
-                }
-                
-                appendMessage('assistant', data.reply);
-                messageHistory.push({ role: 'assistant', content: data.reply });
-                
-            } catch (error) {
-                console.error('Error:', error);
-                if(document.getElementById('typing-indicator')) {
-                    chatWindow.removeChild(typingIndicator);
-                }
-                appendMessage('assistant', '⚠️ Lo siento, hubo un error de conexión. Por favor, intenta nuevamente.');
-            } finally {
-                sendButton.disabled = false;
-                userInput.disabled = false;
-                userInput.focus();
+@app.route("/widget", methods=["GET"])
+def widget():
+    """Endpoint específico para el widget"""
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>AboLegal Widget</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            body { 
+                margin: 0; 
+                padding: 0; 
+                font-family: 'Segoe UI', Arial, sans-serif;
+                background: #f8f9fa;
+                height: 100vh;
+                overflow: hidden;
             }
-        }
+            .chat-container {
+                display: flex;
+                flex-direction: column;
+                height: 100vh;
+            }
+            .chat-header {
+                background: linear-gradient(135deg, #1a237e 0%, #283593 100%);
+                color: white;
+                padding: 15px 20px;
+                text-align: center;
+                font-weight: 600;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }
+            #chat-window {
+                flex: 1;
+                overflow-y: auto;
+                padding: 20px;
+                background: white;
+            }
+            .message {
+                margin-bottom: 15px;
+                padding: 12px 16px;
+                border-radius: 18px;
+                line-height: 1.4;
+                max-width: 85%;
+                animation: fadeIn 0.3s ease-in;
+            }
+            @keyframes fadeIn {
+                from { opacity: 0; transform: translateY(10px); }
+                to { opacity: 1; transform: translateY(0); }
+            }
+            .user {
+                background: #1a237e;
+                color: white;
+                margin-left: auto;
+                border-bottom-right-radius: 6px;
+            }
+            .assistant {
+                background: #f1f3f4;
+                color: #333;
+                border: 1px solid #e0e0e0;
+                margin-right: auto;
+                border-bottom-left-radius: 6px;
+            }
+            .input-container {
+                padding: 20px;
+                background: white;
+                border-top: 1px solid #e0e0e0;
+            }
+            .input-row {
+                display: flex;
+                gap: 10px;
+            }
+            #user-input {
+                flex: 1;
+                padding: 12px 16px;
+                border: 2px solid #e0e0e0;
+                border-radius: 25px;
+                outline: none;
+                font-size: 14px;
+            }
+            #user-input:focus {
+                border-color: #1a237e;
+            }
+            #send-button {
+                padding: 12px 20px;
+                background: #1a237e;
+                color: white;
+                border: none;
+                border-radius: 25px;
+                cursor: pointer;
+                font-weight: 600;
+            }
+            #send-button:disabled {
+                background: #ccc;
+                cursor: not-allowed;
+            }
+            .typing {
+                color: #666;
+                font-style: italic;
+                padding: 12px 16px;
+            }
+            .dot-flashing {
+                display: inline-block;
+                position: relative;
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                background-color: #1a237e;
+                animation: dotFlashing 1s infinite linear alternate;
+                margin-left: 8px;
+            }
+            @keyframes dotFlashing {
+                0% { background-color: #1a237e; }
+                50%, 100% { background-color: rgba(26, 35, 126, 0.2); }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="chat-container">
+            <div class="chat-header">
+                ⚖️ Asesor Legal AboLegal
+            </div>
+            <div id="chat-window"></div>
+            <div class="input-container">
+                <div class="input-row">
+                    <input type="text" id="user-input" placeholder="Escribe tu consulta legal..." autocomplete="off">
+                    <button id="send-button">Enviar</button>
+                </div>
+            </div>
+        </div>
 
-        // Event listeners
-        sendButton.addEventListener('click', sendMessage);
-        userInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') sendMessage();
-        });
-    </script>
-</body>
-</html>
-"""
+        <script>
+            const chatWindow = document.getElementById('chat-window');
+            const userInput = document.getElementById('user-input');
+            const sendButton = document.getElementById('send-button');
+            
+            let messageHistory = [];
 
-# --- Rutas de Flask ---
-@app.route("/", methods=["GET"])
-def index():
-    return render_template_string(CHAT_HTML)
+            function appendMessage(sender, message) {
+                const msgDiv = document.createElement('div');
+                msgDiv.className = `message ${sender}`;
+                msgDiv.innerHTML = message.replace(/\n/g, '<br>');
+                chatWindow.appendChild(msgDiv);
+                chatWindow.scrollTop = chatWindow.scrollHeight;
+            }
+
+            // Mensaje inicial
+            document.addEventListener('DOMContentLoaded', () => {
+                appendMessage('assistant', '¡Hola! Soy Lex, tu asistente legal de AboLegal. ¿En qué puedo ayudarte con tu situación legal hoy?');
+            });
+
+            async function sendMessage() {
+                const message = userInput.value.trim();
+                if (!message) return;
+
+                appendMessage('user', message);
+                userInput.value = '';
+                sendButton.disabled = true;
+                userInput.disabled = true;
+
+                // Indicador de typing
+                const typingIndicator = document.createElement('div');
+                typingIndicator.className = 'typing';
+                typingIndicator.innerHTML = 'Lex está analizando tu caso<span class="dot-flashing"></span>';
+                chatWindow.appendChild(typingIndicator);
+                chatWindow.scrollTop = chatWindow.scrollHeight;
+
+                try {
+                    const response = await fetch('/chat', {
+                        method: 'POST',
+                        headers: { 
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({ 
+                            message: message,
+                            session_id: 'widget_' + Date.now()
+                        })
+                    });
+
+                    const data = await response.json();
+                    
+                    // Remover typing
+                    chatWindow.removeChild(typingIndicator);
+                    
+                    if (data.reply) {
+                        appendMessage('assistant', data.reply);
+                    } else {
+                        throw new Error('Respuesta vacía del servidor');
+                    }
+                } catch (error) {
+                    console.error('Error:', error);
+                    chatWindow.removeChild(typingIndicator);
+                    appendMessage('assistant', '🔧 No pudimos procesar tu consulta. Por favor, intenta nuevamente en unos momentos.');
+                } finally {
+                    sendButton.disabled = false;
+                    userInput.disabled = false;
+                    userInput.focus();
+                }
+            }
+
+            // Event listeners
+            sendButton.addEventListener('click', sendMessage);
+            userInput.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') sendMessage();
+            });
+
+            userInput.focus();
+        </script>
+    </body>
+    </html>
+    """)
 
 @app.route("/chat", methods=["POST", "OPTIONS"])
 def chat():
@@ -276,34 +255,28 @@ def chat():
             return jsonify({"error": "No JSON data received"}), 400
 
         user_msg = data.get("message", "").strip()
-        session_id = data.get("session_id", "default")
-        history = data.get("history", [])
-
         if not user_msg:
             return jsonify({"reply": "Por favor, escribe tu consulta legal."})
 
-        # Construir contexto de conversación
-        conversation = [{"role": "user", "parts": [INITIAL_PROMPT]}]
-        
-        # Agregar historial reciente (últimos 6 mensajes para contexto)
-        recent_history = history[-6:] if len(history) > 6 else history
-        for msg in recent_history:
-            conversation.append({"role": "user" if msg["role"] == "user" else "model", "parts": [msg["content"]]})
+        logger.info(f"Received message: {user_msg}")
 
-        # Agregar mensaje actual
-        conversation.append({"role": "user", "parts": [user_msg]})
-
+        # Llamar a Gemini con formato correcto
         try:
-            # Llamar a Gemini
-            response = model.generate_content(conversation)
+            response = model.generate_content(
+                f"{LEGAL_PROMPT}\n\nConsulta del usuario: {user_msg}"
+            )
             reply = response.text.strip()
+            logger.info("Successfully got response from Gemini")
+            
         except Exception as e:
-            reply = f"🔧 Estamos mejorando el servicio. Por favor, reformula tu pregunta o intenta nuevamente en unos momentos. Error: {str(e)}"
+            logger.error(f"Gemini API error: {str(e)}")
+            reply = "🔍 Estoy analizando tu caso de despido. Por el momento, te recomiendo: Reunir toda tu documentación laboral (contrato, liquidaciones, etc.) y contactar directamente con nuestro equipo al +56 X XXX XXXX para una asesoría personalizada."
 
         return jsonify({"reply": reply})
 
     except Exception as e:
-        return jsonify({"reply": "❌ Error interno del servidor. Por favor, recarga la página e intenta nuevamente."}), 500
+        logger.error(f"General error: {str(e)}")
+        return jsonify({"reply": "⚖️ Como abogado especializado, te recomiendo documentar todo por escrito y buscar asesoría legal presencial. Puedes contactarnos en info@abolegal.cl"}), 500
 
 @app.route("/health", methods=["GET"])
 def health_check():
